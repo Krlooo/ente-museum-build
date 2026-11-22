@@ -1,0 +1,104 @@
+name: build
+
+# Builds Ente's server (museum) from the exact commit that Ente ships as ghcr.io/ente/server:latest,
+# with one small patch: museum can bind to a chosen host instead of all interfaces.
+# Why: on a shared host without Docker, high ports are reachable from the internet, and museum
+# listens on ":<port>" and ":2112" (metrics). With the patch it listens on 127.0.0.1 only.
+# Result: a release "museum-<commit>" with museum-linux-amd64.tar.gz (binary + migrations + templates).
+
+on:
+  schedule:
+    - cron: "0 3 * * 6"   # Saturdays 03:00 UTC; the box updater runs on Sunday
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Ente commit to build (empty = the one in ghcr.io/ente/server:latest)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pick the commit
+        id: pick
+        run: |
+          set -euo pipefail
+          c="${{ github.event.inputs.commit }}"
+          if [ -z "$c" ]; then
+            docker pull -q ghcr.io/ente/server:latest >/dev/null
+            c=$(docker inspect ghcr.io/ente/server:latest --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^GIT_COMMIT=//p')
+          fi
+          [ ${#c} -eq 40 ] || { echo "no commit found: '$c'"; exit 1; }
+          echo "commit=$c" >> "$GITHUB_OUTPUT"
+          echo "tag=museum-${c:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already built
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.pick.outputs.tag }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "already built"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Ente
+        if: steps.exists.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ente-io/ente
+          ref: ${{ steps.pick.outputs.commit }}
+          sparse-checkout: server
+          path: ente
+
+      - name: Patch listen addresses
+        if: steps.exists.outputs.skip == 'false'
+        working-directory: ente/server
+        run: |
+          set -euo pipefail
+          f=cmd/museum/main.go
+          sed -i 's|httpServer.Addr = fmt.Sprintf(":%d", port)|httpServer.Addr = fmt.Sprintf("%s:%d", krloEnvOr("MUSEUM_LISTEN_HOST", ""), port)|' $f
+          sed -i 's|metricsServer := \&http.Server{Addr: ":2112"}|metricsServer := \&http.Server{Addr: krloEnvOr("MUSEUM_METRICS_ADDR", ":2112")}|' $f
+          printf '\n// krloEnvOr: added by Krlooo/ente-museum-build (listen-address patch).\nfunc krloEnvOr(k, d string) string {\n\tif v := os.Getenv(k); v != "" {\n\t\treturn v\n\t}\n\treturn d\n}\n' >> $f
+          # Fail loudly if upstream changed those lines.
+          [ "$(grep -c 'krloEnvOr("MUSEUM_LISTEN_HOST"' $f)" = 1 ] || { echo "listen patch did not apply"; exit 1; }
+          [ "$(grep -c 'krloEnvOr("MUSEUM_METRICS_ADDR"' $f)" = 1 ] || { echo "metrics patch did not apply"; exit 1; }
+          git -C .. diff --stat
+
+      - name: Set up Go
+        if: steps.exists.outputs.skip == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ente/server/go.mod
+          cache-dependency-path: ente/server/go.sum
+
+      - name: Build
+        if: steps.exists.outputs.skip == 'false'
+        working-directory: ente/server
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o museum cmd/museum/main.go
+          mkdir -p ../../dist/museum
+          cp -r museum configurations migrations mail-templates web-templates ../../dist/museum/
+          git -C .. diff > ../../dist/museum/krlo-patch.diff
+          echo "${{ steps.pick.outputs.commit }}" > ../../dist/museum/GIT_COMMIT
+          cd ../../dist && tar -czf museum-linux-amd64.tar.gz museum && sha256sum museum-linux-amd64.tar.gz > museum-linux-amd64.tar.gz.sha256
+
+      - name: Release
+        if: steps.exists.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          c="${{ steps.pick.outputs.commit }}"
+          gh release create "${{ steps.pick.outputs.tag }}" -R "$GITHUB_REPOSITORY" \
+            --title "museum ${c:0:12}" \
+            --notes "Ente server (museum) built from ente-io/ente@$c (the commit of ghcr.io/ente/server:latest), with the listen-address patch (krlo-patch.diff inside the archive). Source: https://github.com/ente-io/ente/tree/$c/server" \
+            dist/museum-linux-amd64.tar.gz dist/museum-linux-amd64.tar.gz.sha256
