@@ -61,12 +61,15 @@ jobs:
         run: |
           set -euo pipefail
           f=cmd/museum/main.go
-          sed -i 's|httpServer.Addr = fmt.Sprintf(":%d", port)|httpServer.Addr = fmt.Sprintf("%s:%d", krloEnvOr("MUSEUM_LISTEN_HOST", ""), port)|' $f
-          sed -i 's|metricsServer := \&http.Server{Addr: ":2112"}|metricsServer := \&http.Server{Addr: krloEnvOr("MUSEUM_METRICS_ADDR", ":2112")}|' $f
+          # Both spellings upstream has used: server.Run(fmt.Sprintf(":%d", port)) / httpServer.Addr = ...,
+          # and http.ListenAndServe(":2112", nil) / &http.Server{Addr: ":2112"}.
+          sed -i 's|fmt.Sprintf(":%d", port)|fmt.Sprintf("%s:%d", krloEnvOr("MUSEUM_LISTEN_HOST", ""), port)|' $f
+          sed -i 's|":2112"|krloEnvOr("MUSEUM_METRICS_ADDR", ":2112")|' $f
           printf '\n// krloEnvOr: added by Krlooo/ente-museum-build (listen-address patch).\nfunc krloEnvOr(k, d string) string {\n\tif v := os.Getenv(k); v != "" {\n\t\treturn v\n\t}\n\treturn d\n}\n' >> $f
           # Fail loudly if upstream changed those lines.
-          [ "$(grep -c 'krloEnvOr("MUSEUM_LISTEN_HOST"' $f)" = 1 ] || { echo "listen patch did not apply"; exit 1; }
-          [ "$(grep -c 'krloEnvOr("MUSEUM_METRICS_ADDR"' $f)" = 1 ] || { echo "metrics patch did not apply"; exit 1; }
+          [ "$(grep -c 'krloEnvOr("MUSEUM_LISTEN_HOST"' $f)" -ge 1 ] || { echo "listen patch did not apply"; exit 1; }
+          [ "$(grep -c 'krloEnvOr("MUSEUM_METRICS_ADDR"' $f)" -ge 1 ] || { echo "metrics patch did not apply"; exit 1; }
+          ! grep -n '":%d"\|":2112"' $f || { echo "an unpatched listen address is left"; exit 1; }
           git -C .. diff --stat
 
       - name: Set up Go
